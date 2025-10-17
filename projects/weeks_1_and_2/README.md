@@ -1,6 +1,6 @@
 # Course Research Projects — Week 1 Guide
 
-This README provides **Week 1 plans** (of 6) for two joint research papers. Each team has **2 students** working **~20 hours/week**. Week 1 focuses on **foundations, dataset understanding, EDA, baselines, and a concrete model plan**.
+This README provides **Week 2 plans**  for two joint research papers. Each team has **2 students** working **~20 hours/week**. Weeks 1 and 2 focuses on **foundations, dataset understanding, EDA, baselines, and a concrete model plan**.
 
 ---
 
@@ -27,11 +27,11 @@ This README provides **Week 1 plans** (of 6) for two joint research papers. Each
 ## Week 1 Objective
 Establish scientific framing, ensure a reproducible setup, and perform initial EDA to de-risk modeling in Weeks 2–6.
 
-### For All Teams (Joint Prep, ~6h)
-- [ ] **Scientific context & scope (2h)**  
+### For All Teams (Joint Prep)
+- [ ] **Scientific context & scope**  
   - Read/align on paper outline, target questions, expected contributions.  
   - Draft **1-page project proposal**: problem, approach, hypotheses, integration into joint manuscript.
-- [ ] **Environment & data readiness (4h)**  
+- [ ] **Environment & data readiness **  
   - Create GitHub repo & structure (`data/`, `notebooks/`, `src/`, `reports/`).  
   - Reproducible env (Conda + `requirements.txt` or `environment.yml`).  
   - Load and inspect **The Well Dataset** (shapes, fields, params).  
@@ -39,40 +39,59 @@ Establish scientific framing, ensure a reproducible setup, and perform initial E
 
 ---
 
-## Project 01 — Predicting Emergent Dynamics (Team 1)
+## Project 01 — Predicting Emergent Dynamics (Team 1: Jorge and Jhon)
 **Goal:** Forecast short-term evolution of **global observables** (e.g., vorticity, order parameters, energy).
 
-### Activities (~14h)
-- [ ] **Feature extraction & baseline EDA (6h)**  
+### Activities 
+- [ ] **Feature extraction & baseline EDA **  
   - Compute time-series of targeted observables; visualize trends & autocorrelation.
-- [ ] **Problem framing & baseline model (4h)**  
+- [ ] **Problem framing & baseline model **  
   - Fix input window & forecast horizon (e.g., 5→5 steps).  
   - Baselines: persistence, linear regression; evaluate MSE/MAE.
-- [ ] **Advanced model plan (4h)**  
+- [ ] **Advanced model plan **  
   - Literature skim on RNN/LSTM/attention for physics time series.  
   - Draft **model spec** (I/O shapes, loss, training protocol, validation split).
 
-### Deliverables (end of Week 1)
+### Deliverables 
 - [ ] Notebook: data exploration & observable extraction  
 - [ ] Baseline prediction results + plots  
 - [ ] **2–3 page model plan** (architecture, metrics, schedule)
 
 ---
 
-## Project 02 — Revealing Hidden Order (Team 2)
+## Project 02 — Revealing Hidden Order (Team 2: Leonel and Isaac)
 **Goal:** Learn **low-dimensional latent spaces** that capture phases/transitions and organize dynamics across regimes.
 
-### Activities (~14h)
-- [ ] **Preprocessing & sampling (6h)**  
+### Activities 
+- [ ] **Preprocessing & sampling **  
   - Decide representation (frames, sequences, patches).  
   - Normalize/standardize; create a prototype subset (e.g., 500–1000 frames).
-- [ ] **Exploratory visualization (4h)**  
+- [ ] **Exploratory visualization **  
   - PCA / t-SNE on flattened frames or descriptors; inspect phase/regime separation.
-- [ ] **Latent model design (4h)**  
+- [ ] **Latent model design **  
   - AE/VAE architecture sketch (encoder/decoder, latent dims, losses).  
   - Define metrics: clustering separation, reconstruction error, trajectory smoothness.
 
-### Deliverables (end of Week 1)
+
+## Project 03 — Learning Physics-Aware Surrogates (Team 3: Franklin and Daniel)
+**Goal:** Build interpretable, generalizable surrogates that integrate **physical constraints** (e.g., divergence-free fields, conservation) with ML to simulate active matter across parameter regimes.
+
+### Activities 
+- [ ] **Physics characterization **  
+  - Identify key constraints/symmetries (e.g., incompressibility, energy budget).  
+  - Express them mathematically; map each to a viable **loss term**, architectural constraint, or training prior.  
+  - List candidate PDEs/residuals relevant to the dataset and feasible to include.
+- [ ] **Baseline emulation **  
+  - Train a simple next-step predictor (e.g., shallow CNN or UNet-lite) from past frames/fields.  
+  - Record accuracy and **failure modes** (e.g., drift, non-physical artifacts).
+- [ ] **Hybrid model plan **  
+  - Survey PINNs / physics-guided networks for fluid/active matter.  
+  - Draft a **hybrid approach**: physics loss (PDE residuals), divergence-free projection layers, or symplectic/volume-preserving updates.  
+  - Define evaluation metrics: physical residuals, divergence norm, generalization to unseen parameters, robustness to noise.
+
+
+
+### Deliverables 
 - [ ] Notebook: preprocessing pipeline & PCA/t-SNE  
 - [ ] Draft architecture & evaluation plan
 
@@ -92,8 +111,8 @@ Establish scientific framing, ensure a reproducible setup, and perform initial E
 ## Week 1 Objective
 Ground biological context, validate data quality, produce descriptor/latent EDA, and fix an initial modeling plan.
 
-### For All Teams (Joint Prep, ~6h)
-- [ ] **Biology & manuscript framing (2h)**  
+### For All Teams (Joint Prep)
+- [ ] **Biology & manuscript framing **  
   - Review developmental stages (blastula → gastrula), expected morphology, mutant phenotypes.  
   - Draft **1-page research summary** (goals, hypotheses, contribution).
 - [ ] **Tech setup & dataset scan (4h)**  
@@ -103,41 +122,41 @@ Ground biological context, validate data quality, produce descriptor/latent EDA,
 
 ---
 
-## Project 04 — Latent Mapping of Developmental Trajectories (Team 4)
+## Project 04 — Latent Mapping of Developmental Trajectories (Team 4: Pablo)
 **Goal:** Learn latent spaces that organize **time** and **genotype** and align developmental stages across embryos.
 
-### Activities (~14h)
-- [ ] **QC & descriptors (4h)**  
+### Activities 
+- [ ] **QC & descriptors **  
   - Load sequences for all genotypes; check alignment/masks.  
   - Plot descriptors over time (area, major/minor axis, aspect ratio).
-- [ ] **Baseline DR (4h)**  
+- [ ] **Baseline DR **  
   - PCA / t-SNE on images or descriptors; test grouping by stage/genotype.
-- [ ] **Latent model plan (6h)**  
+- [ ] **Latent model plan **  
   - AE/VAE prototype (input shape, latent size, losses).  
   - Plan trajectory visualization (per-embryo paths through latent space).  
   - Metrics: stage separability, genotype clustering, reconstruction error.
 
-### Deliverables (end of Week 1)
+### Deliverables 
 - [ ] Notebook: QC + descriptor trends + PCA/t-SNE  
 - [ ] Draft AE/VAE architecture & evaluation criteria
 
 ---
 
-## Project 05 — Forecasting Morphogenesis (Team 5)
+## Project 05 — Forecasting Morphogenesis (Team 5: Alejandro and Angel)
 **Goal:** Forecast future embryo morphology in **latent** and **image space**.
 
-### Activities (~14h)
-- [ ] **Data pipeline (4h)**  
+### Activities 
+- [ ] **Data pipeline **  
   - Dataloaders for sequences + masks; embryo-wise or genotype-wise splits.  
   - Placeholder encoder/decoder (or use descriptors initially).
-- [ ] **Temporal EDA (4h)**  
+- [ ] **Temporal EDA **  
   - Time evolution of area, centroid motion, axis lengths; auto/cross-correlations.
-- [ ] **Forecasting design (6h)**  
+- [ ] **Forecasting design **  
   - Choose input window & horizon (e.g., 6 frames ≈ 30 min ahead).  
   - Draft ConvLSTM / temporal Transformer plan; losses & evaluation  
     (SSIM, PSNR, RMSE on biological features; genotype-stratified metrics).
 
-### Deliverables (end of Week 1)
+### Deliverables 
 - [ ] Notebook: temporal descriptor analysis  
 - [ ] Baseline: **persistence** forecaster & error curves  
 - [ ] Draft architecture & training plan
@@ -147,7 +166,7 @@ Ground biological context, validate data quality, produce descriptor/latent EDA,
 ## Paper 2 — End-of-Week Milestone (All Teams)
 - [ ] Working EDA notebooks (loading, QC, plots)  
 - [ ] **Modeling plan** (architecture, metrics, training schedule)  
-- [ ] **Weeks 2–6 timeline** per team
+
 
 ---
 
