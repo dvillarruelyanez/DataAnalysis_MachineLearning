@@ -110,15 +110,8 @@ Establish scientific framing, ensure a reproducible setup, and perform initial E
 
 ## Week 1 Objective
 Ground biological context, validate data quality, produce descriptor/latent EDA, and fix an initial modeling plan.
+- Review developmental stages (blastula → gastrula), expected morphology, mutant phenotypes.  
 
-### For All Teams (Joint Prep)
-- [ ] **Biology & manuscript framing **  
-  - Review developmental stages (blastula → gastrula), expected morphology, mutant phenotypes.  
-  - Draft **1-page research summary** (goals, hypotheses, contribution).
-- [ ] **Tech setup & dataset scan (4h)**  
-  - Repo structure (`data/`, `notebooks/`, `models/`, `results/`).  
-  - Verify libraries (PyTorch/TensorFlow, OpenCV, scikit-image/learn, matplotlib).  
-  - **Dataset report**: counts, resolutions, masks, descriptors, splits.
 
 ---
 
