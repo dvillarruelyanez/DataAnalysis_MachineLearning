@@ -151,10 +151,14 @@ PDE fits, residual maps, physical parameter estimates.
 Each `projectXX/` folder follows this structure:
 ```
 projectXX/
-├── data/          # Datasets or preprocessing scripts
-├── src/           # Source code (models, loss functions, utils)
-└── notebooks/     # Exploratory notebooks, final analyses, figures
-└── results/      # resulst of teh analysis> tables, figures, etc.
+├── data/                # raw/processed data (or symlinks)
+├── notebooks/           # exploratory & analysis notebooks
+├── src/                 # reusable code (dataloaders, models, utils)
+├── models/              # saved checkpoints
+├── results/             # figures, tables, metrics
+├── reports/             # week summaries, project plans
+├── requirements.txt     # pinned deps (or environment.yml)
+└── README.md
 ```
 
 ---
