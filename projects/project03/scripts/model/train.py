@@ -259,13 +259,17 @@ class ModelTrainer:
             for batch in (bar := tqdm(train_loader)):
                 x = batch['input_fields']
 
-                xprev = x[:, -1, ...]
+                xprev = x[:, -1, ...].to(self.device)
                 xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
 
                 x = self._preprocess(x)
                 xnorm = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
 
                 y = batch['output_fields']
+                
+                yphys = y[:, 0, ...].to(self.device)
+                yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
+
                 ynorm = self._preprocess(y)
                 ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
 
@@ -274,7 +278,13 @@ class ModelTrainer:
                 if is_warmup:
                     loss = F.mse_loss(fx, ynorm)
                 else:
-                    loss, components = criterion_physics(fx, ynorm, xprev)
+                    loss_mse = F.mse_loss(fx, ynorm)
+
+                    fx_phys = self._postprocess(fx)
+
+                    loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
+
+                    loss = loss_mse + loss_physics
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -293,22 +303,31 @@ class ModelTrainer:
                 for batch in (bar := tqdm(val_loader)):
                     x = batch['input_fields']
 
-                    xprev = x[:, -1, ...]
+                    xprev = x[:, -1, ...].to(self.device)
                     xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
 
                     x = self._preprocess(x)
                     xnorm = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
 
                     y = batch['output_fields']
+                
+                    yphys = y[:, 0, ...].to(self.device)
+                    yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
+
                     ynorm = self._preprocess(y)
                     ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
-                    
+
                     fx = self.model_instance(xnorm)
 
                     if is_warmup:
                         loss = F.mse_loss(fx, ynorm)
                     else:
-                        loss, components = criterion_physics(fx, ynorm, xprev)
+                        loss_mse = F.mse_loss(fx, ynorm)
+
+                        fx_phys = self._postprocess(fx)
+                        loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
+
+                        loss = loss_mse + loss_physics
 
                     bar.set_postfix(loss=loss.item())
                     val_loss += loss.item()
@@ -325,7 +344,7 @@ class ModelTrainer:
 
                 torch.save(self.model_instance.state_dict(), save_dir + 'best_model.pth')
                 self.save_stats(save_dir)
-                
+
                 logging.info(f"Saved best model to {save_dir + 'best_model.pth'}")
             else:
                 patience_count += 1

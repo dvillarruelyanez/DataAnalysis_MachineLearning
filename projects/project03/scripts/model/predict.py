@@ -74,7 +74,7 @@ class ModelPredictor:
         y_pred = self.trainer._postprocess(y_pred_norm)
 
         y_true = sample['output_fields'].unsqueeze(0)
-        y_true = rearrange(y_true, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+        y_true = rearrange(y_true, "B To Lx Ly F -> B (To F) Lx Ly")
 
         return {
             'input': x.cpu().numpy(),

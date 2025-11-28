@@ -18,8 +18,12 @@ class PhysicsLoss(nn.Module):
         self.dt = dt
         self.device = device
 
-        self.loss_keys = ['MSE', 'continuity', 'divergence', 'symmetry', 'KE']
-        initial_log_vars = torch.tensor([-2.0, 3.0, 3.0, 3.0, 3.0], device=device)
+        #self.loss_keys = ['MSE', 'continuity', 'divergence', 'symmetry', 'KE']
+        #initial_log_vars = torch.tensor([-2.0, 3.0, 3.0, 3.0, 3.0], device=device)
+
+        self.loss_keys = ['continuity', 'divergence', 'symmetry', 'KE']
+        initial_log_vars = torch.tensor([ 3.0, 3.0, 3.0, 3.0], device=device)
+
         self.log_vars = nn.Parameter(initial_log_vars)
 
         self.register_buffer('kernel_x', torch.tensor([[[[-1, 0, 1],
@@ -45,7 +49,7 @@ class PhysicsLoss(nn.Module):
     def forward(self, ypred, ytrue, xprev=None):
         losses = {}
 
-        losses['mse'] = F.mse_loss(ypred, ytrue)
+        #losses['mse'] = F.mse_loss(ypred, ytrue)
 
         rho = ypred[:, 0]
         vx  = ypred[:, 1]
