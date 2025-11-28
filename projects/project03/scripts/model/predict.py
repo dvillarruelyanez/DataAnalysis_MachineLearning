@@ -15,21 +15,40 @@ from .train import ModelTrainer
 class ModelPredictor:
     """
     """
-    def __init__(self, dataset, weights, device='cuda', n_input=4, n_output=1):
+    def __init__(self, dataset, weights_path, stats_path, device='cuda', n_input=4, n_output=1):
         self.device = device
         self.n_input = n_input
         self.n_output = n_output
 
         self.trainer = ModelTrainer(dataset, CNextUNetbaseline, device, n_workers=0)
+
+        if not os.path.exists(stats_path):
+            raise FileNotFoundError(f'Stats file not found at: {stats_path}')
         
-        print('Setting up model and calculating normalisation stats...')
-        self.trainer._setup(n_input, n_output)
+        print(f'Loading stats from {stats_path}...')
+        stats = torch.load(stats_path, map_location=device)
+        self.trainer.mu = stats['mu']
+        self.trainer.sigma = stats['sigma']
 
-        if not os.path.exists(weights):
-            raise FileNotFoundError(f'Weights file not found at: {weights}')
+        in_channels = n_input * self.trainer.F
+        out_channels = n_output * self.trainer.F
+        grid = (256, 256)
 
-        print('Loading weights from {weights}...')
-        state_dict = torch.load(weights, map_location=device)
+        self.trainer.model_instance = self.trainer.model(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            spatial_resolution=grid,
+            initial_dimension=42,
+            up_down_blocks=4,
+            blocks_per_stage=2,
+            bottleneck_blocks=1
+        ).to(device)
+
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f'Weights file not found at: {weights_path}')
+
+        print('Loading weights from {weights_path}...')
+        state_dict = torch.load(weights_path, map_location=device)
         self.trainer.model_instance.load_state_dict(state_dict)
 
         self.trainer.model_instance.eval()

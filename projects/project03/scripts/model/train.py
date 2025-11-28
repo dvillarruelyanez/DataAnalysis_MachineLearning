@@ -10,6 +10,8 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from tqdm import tqdm
 from einops import rearrange
 from torch.utils.data import DataLoader
@@ -29,7 +31,7 @@ logging.basicConfig(
 )
 
 class ModelTrainer:
-    def __init__(self, path, model, device, n_workers):
+    def __init__(self, path, model, device, n_workers, mu=None, sigma=None):
         self.path = path
         self.model = model
 
@@ -42,8 +44,8 @@ class ModelTrainer:
     
         self.n_workers = int(n_workers) if n_workers is not None else 0
         self.F = 11
-        self.mu = None
-        self.sigma = None
+        self.mu = mu
+        self.sigma = sigma
         self.model_instance = None
 
     def _loader(self, split, n_steps_input, n_steps_output):
@@ -58,31 +60,34 @@ class ModelTrainer:
 
         return dataset
     
-    def _setup(self, n_input, n_output):
+    def _setup(self, train_dataset, n_input, n_output):
         logging.info('Setting up model and normalisation')
 
-        train_dataset = self._loader('train', n_input, n_output)
+        if self.mu == None and self.sigma == None:
+            max_samples = min(30, len(train_dataset))
+            sample_idx  = np.linspace(0, len(train_dataset) - 1, num=max_samples).astype(int)
 
-        max_samples = min(100, len(train_dataset))
-        sample_idx  = np.linspace(0, len(train_dataset) - 1, num=max_samples).astype(int)
+            mu_sum = torch.zeros(self.F)
+            sigma_sum = torch.zeros(self.F)
+            count = 0
 
-        mu_sum = torch.zeros(self.F)
-        sigma_sum = torch.zeros(self.F)
-        count = 0
+            for idx in sample_idx:
+                x = train_dataset[idx]['input_fields']
+                x = x.reshape(-1, self.F)
 
-        for idx in sample_idx:
-            x = train_dataset[idx]['input_fields']
-            x = x.reshape(-1, self.F)
+                mu_sum += x.mean(dim=0)
+                sigma_sum += x.std(dim=0)
+                count += 1
 
-            mu_sum += x.mean(dim=0)
-            sigma_sum += x.std(dim=0)
-            count += 1
+            self.mu = (mu_sum / count).to(self.device)
+            self.sigma = (sigma_sum / count).to(self.device)
+            self.sigma[self.sigma == 0] = 1.0
 
-        self.mu = (mu_sum / count).to(self.device)
-        self.sigma = (sigma_sum / count).to(self.device)
-        self.sigma[self.sigma == 0] = 1.0
+            logging.info('Normalisation stats calculated!')
 
-        logging.info('Normalisation stats calculated!')
+        else:
+
+            logging.info('Using provided mu, sigma')
 
         in_channels = n_input * self.F
         out_channels = n_output * self.F
@@ -120,6 +125,14 @@ class ModelTrainer:
             sigma_b = self.sigma.repeat(n_channels // self.F).view(1, n_channels, 1, 1)
 
         return (y * sigma_b) + mu_b
+    
+    def save_stats(self, save_dir):
+        stats_path = os.path.join(save_dir, 'stats.pt')
+        torch.save({
+            'mu': self.mu,
+            'sigma': self.sigma
+        }, stats_path)
+        logging.info(f'Normalisation stats saved to {stats_path}')
     
     def train_benchmark(self, batch, epochs, lr, patience, n_input, n_output):
         self._setup(n_input, n_output)
@@ -196,8 +209,11 @@ class ModelTrainer:
                 os.makedirs(all_dir, exist_ok=True)
                 save_dir = './outputs/baseline'
                 os.makedirs(save_dir, exist_ok=True)
-                torch.save(self.model_instance.state_dict(), save_dir + 'best_model.pth')
-                logging.info(f"Saved best model to {save_dir + 'best_model.pth'}")
+
+                torch.save(self.model_instance.state_dict(), os.path.join(save_dir, 'best_model.pth'))
+                self.save_stats(save_dir)
+
+                logging.info(f"Saved best model to {save_dir + 'best_baseline.pth'}")
             else:
                 patience_count += 1
 
@@ -208,32 +224,23 @@ class ModelTrainer:
         return train_losses, val_losses
     
     def train(self, batch, epochs, warmup_epochs, lr, patience, n_input, n_output):
-        
-        self._setup(n_input, n_output)
-        optimizer = torch.optim.Adam(self.model_instance.parameters(), lr=lr)
 
         train_dataset = self._loader('train', n_input, n_output)
         valid_dataset  = self._loader('valid', n_input, n_output)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch, shuffle=True, num_workers=self.n_workers)
-        val_loader = DataLoader(valid_dataset, batch_size=batch, shuffle=False, num_workers=self.n_workers)
-
-        target_weights = {
-            'mse': 1.0,
-            'continuity': 0.1,
-            'divergence': 0.1,
-            'symmetry': 1.0,
-            'KE': 0.01
-        }
+        self._setup(train_dataset, n_input, n_output)
 
         criterion_physics = PhysicsLoss(
             spatial_dims=(256, 256),
             dx=1.0,
-            dt=0.5,
-            weights=target_weights
+            dt=0.5
         ).to(self.device)
 
-        criterion_mse = nn.MSELoss()
+        params = list(self.model_instance.parameters()) + list(criterion_physics.parameters())
+        optimizer = torch.optim.Adam(params, lr=lr)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch, shuffle=True, num_workers=self.n_workers)
+        val_loader = DataLoader(valid_dataset, batch_size=batch, shuffle=False, num_workers=self.n_workers)
 
         train_losses = []
         val_losses = []
@@ -242,21 +249,21 @@ class ModelTrainer:
 
         for epoch in range(epochs):
 
-            if epoch < warmup_epochs:
-                alpha = epoch / warmup_epochs
-            else:
-                alpha = 1.0
+            is_warmup = epoch < warmup_epochs
 
-            criterion_physics.physics_scale(alpha)
-
-            train_loss = 0.0
-            self.model_instance.train()
-            print(f'EPOCH {epoch + 1} / {epochs}')
+            if epoch % 5 == 0:
+                with torch.no_grad():
+                    ws = torch.exp(-criterion_physics.log_vars)
+                    print(f"Epoch {epoch} Weights [MSE, Cont, Div, Sym, KE]:\n{ws.cpu().numpy()}")
 
             for batch in (bar := tqdm(train_loader)):
                 x = batch['input_fields']
-                xnorm = self._preprocess(x)
-                xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+
+                xprev = x[:, -1, ...]
+                xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
+
+                x = self._preprocess(x)
+                xnorm = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
 
                 y = batch['output_fields']
                 ynorm = self._preprocess(y)
@@ -264,20 +271,17 @@ class ModelTrainer:
 
                 fx = self.model_instance(xnorm)
 
-                ypred = self._postprocess(fx)
-                ytrue = y.to(self.device)
-                ytrue = rearrange(ytrue, "B To Lx Ly F -> B (To F) Lx Ly")
-
-                xprev = x[:, -1, ...].to(self.device)
-                xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
-
-                loss, components = criterion_physics(ypred, ytrue, xprev)
+                if is_warmup:
+                    loss = F.mse_loss(fx, ynorm)
+                else:
+                    loss, components = criterion_physics(fx, ynorm, xprev)
                 
                 optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
                 optimizer.step()
 
-                bar.set_postfix(loss=loss.item())
+                bar.set_postfix(loss=loss.item(), phase="Warmup" if is_warmup else "Hybrid")
                 train_loss += loss.item()
 
             train_loss /= max(1, len(train_loader))
@@ -288,16 +292,24 @@ class ModelTrainer:
             with torch.no_grad():
                 for batch in (bar := tqdm(val_loader)):
                     x = batch['input_fields']
-                    x = self._preprocess(x)
-                    x = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
-                    
-                    y = batch['output_fields']
-                    y = self._preprocess(y)
-                    y = rearrange(y, "B To Lx Ly F -> B (To F) Lx Ly")
-                    
-                    fx = self.model_instance(x)
 
-                    loss = criterion_mse(fx, y)
+                    xprev = x[:, -1, ...]
+                    xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
+
+                    x = self._preprocess(x)
+                    xnorm = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+
+                    y = batch['output_fields']
+                    ynorm = self._preprocess(y)
+                    ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
+                    
+                    fx = self.model_instance(xnorm)
+
+                    if is_warmup:
+                        loss = F.mse_loss(fx, ynorm)
+                    else:
+                        loss, components = criterion_physics(fx, ynorm, xprev)
+
                     bar.set_postfix(loss=loss.item())
                     val_loss += loss.item()
 
@@ -310,7 +322,10 @@ class ModelTrainer:
 
                 save_dir = './outputs/'
                 os.makedirs(save_dir, exist_ok=True)
+
                 torch.save(self.model_instance.state_dict(), save_dir + 'best_model.pth')
+                self.save_stats(save_dir)
+                
                 logging.info(f"Saved best model to {save_dir + 'best_model.pth'}")
             else:
                 patience_count += 1
@@ -318,6 +333,9 @@ class ModelTrainer:
             if patience_count >= patience:
                 print('Early stop triggered')
                 break
+
+        print(f'mu: {self.mu}')
+        print(f'sigma: {self.sigma}')
 
         return train_losses, val_losses
 
@@ -349,7 +367,7 @@ def main():
 
     if mode == 1:
         train, valid = trainer.train_benchmark(batch=4, epochs=156, lr=5e-3, patience=5, n_input=4, n_output=1)
-    elif mode == 0:
+    elif mode == 2:
         train, valid = trainer.train(batch=4, epochs=156, warmup_epochs=5, lr=5e-3, patience=5, n_input=4, n_output=1)
 
     print('TRAINING successful')
