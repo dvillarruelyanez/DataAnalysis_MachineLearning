@@ -7,37 +7,51 @@ Daniel Villarruel-Yanez (2025.11.25)
 
 import torch
 import torch.nn as nn
+from typing import Tuple, Dict
 import torch.nn.functional as F
 
 class PhysicsLoss(nn.Module):
     
-    def __init__(self, spatial_dims, dx, dt, device='cuda'):
+    def __init__(self, spatial_dims: Tuple[int, int], dx: float, dt: float, derivative_scheme: str ='central_diff'):
         super().__init__()
         self.h, self.w = spatial_dims
-        self.dx = dx
-        self.dt = dt
-        self.device = device
+        self.dx = float(dx)
+        self.dt = float(dt)
 
-        #self.loss_keys = ['MSE', 'continuity', 'divergence', 'symmetry', 'KE']
-        #initial_log_vars = torch.tensor([-2.0, 3.0, 3.0, 3.0, 3.0], device=device)
+        self.loss_keys = ['continuity', 'divergence', 'strain_consistency', 'symmetry', 'KE']
 
-        self.loss_keys = ['continuity', 'divergence', 'symmetry', 'KE']
-        initial_log_vars = torch.tensor([ 3.0, 3.0, 3.0, 3.0], device=device)
+        init_val = 1.0
+        self.log_vars = nn.Parameter(torch.full((len(self.loss_keys),), init_val, dtype=torch.float32))
 
-        self.log_vars = nn.Parameter(initial_log_vars)
-
-        self.register_buffer('kernel_x', torch.tensor([[[[-1, 0, 1],
-                                                         [-2, 0, 2],
-                                                         [-1, 0, 1]]]], dtype=torch.float32) / 8.0)
+        if derivative_scheme not in ['central_diff', 'sobel']:
+            raise ValueError('Incorrect derivative scheme. Use "central_diff" or "sobel"')
         
-        self.register_buffer('kernel_y', torch.tensor([[[[-1, -2, -1],
-                                                         [0, 0, 0],
-                                                         [1, 2, 1]]]], dtype=torch.float32) / 8.0)
+        if derivative_scheme == 'central_diff':
+            self.register_buffer('kernel_x', torch.tensor([[[[0, 0, 0],
+                                                             [-0.5, 0, 0.5],
+                                                             [0, 0, 0]]]], dtype=torch.float32) / self.dx)
+        
+            self.register_buffer('kernel_y', torch.tensor([[[[0, -0.5, 0],
+                                                             [0, 0, 0],
+                                                             [0, 0.5, 0]]]], dtype=torch.float32) / self.dx)
+            
+        else:
+            self.register_buffer('kernel_x', torch.tensor([[[[-1, 0, 1],
+                                                             [-2, 0, 2],
+                                                             [-1, 0, 1]]]], dtype=torch.float32) / 8.0)
+            
+            self.register_buffer('kernel_y', torch.tensor([[[[-1, -2, -1],
+                                                             [0, 0, 0],
+                                                             [1, 2, 1]]]], dtype=torch.float32) / 8.0)
 
     def spatial_gradient(self, field):
         """
         """
-        field = field.unsqueeze(1)
+        if field.dim() == 3:
+            field = field.unsqueeze(1)
+        elif field.dim() == 4 and field.size(1) != 1:
+            b, c, h, w = field.shape
+            field = field.view(b*c, 1, h, w)
 
         field_pad = F.pad(field, (1, 1, 1, 1), mode='circular')
 
@@ -47,9 +61,12 @@ class PhysicsLoss(nn.Module):
         return d_dx.squeeze(1), d_dy.squeeze(1)
 
     def forward(self, ypred, ytrue, xprev=None):
-        losses = {}
+        
+        assert ypred.dim() == 4 and ytrue.dim() == 4, "ypred and ytrue must be (B, C, H, W)"
+        device = ypred.device()
+        dtype  = ypred.dtype
 
-        #losses['mse'] = F.mse_loss(ypred, ytrue)
+        losses: Dict[str, torch.Tensor] = {}
 
         rho = ypred[:, 0]
         vx  = ypred[:, 1]
@@ -61,8 +78,8 @@ class PhysicsLoss(nn.Module):
 
         # Incompressibility -> zero divergence in velocity field
 
-        dvx_dx, _ = self.spatial_gradient(vx)
-        _, dvy_dy = self.spatial_gradient(vy)
+        dvx_dx, dvx_dy = self.spatial_gradient(vx)
+        dvy_dx, dvy_dy = self.spatial_gradient(vy)
 
         div = dvx_dx + dvy_dy
 
@@ -96,6 +113,13 @@ class PhysicsLoss(nn.Module):
 
         losses['symmetry'] = torch.mean(Dsym**2) + torch.mean(Esym**2)
 
+        # Strain-velocity consistency
+
+        Dxy_from_v = 0.5 * (dvx_dy + dvy_dx)
+        
+        strain_consistency = torch.mean((Dxy - Dxy_from_v)**2) + torch.mean((Dyx - Dxy_from_v)**2)
+        losses['strain_consistency'] = strain_consistency
+
         # Kinetic energy
 
         rho_true = ytrue[:, 0]
@@ -110,10 +134,13 @@ class PhysicsLoss(nn.Module):
 
         losses['KE'] = F.mse_loss(kpred, ktrue)
 
-        final_loss = 0.0
+        final_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        assert len(self.log_vars) == len(self.loss_keys), "log_vars must match loss_keys length"
+
         for i, key in enumerate(self.loss_keys):
-            precision = torch.exp(-self.log_vars[i])
-            loss_comp = losses[key]
-            final_loss += precision * loss_comp + self.log_vars[i]
+            log_var = self.log_vars[i]
+            precision = torch.exp(-log_var)
+            comp = losses[key]
+            final_loss += 0.5 * precision * comp + 0.5 * log_var
 
         return final_loss, losses

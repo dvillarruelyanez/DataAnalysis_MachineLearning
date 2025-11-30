@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 
 """
-Training script for Project03
-Daniel Villarruel-Yanez (2025.11.25)
+Training script for Project03 (corrected + optimised for GPU)
+Daniel Villarruel-Yanez (2025.11.30) - updated
 """
 
 import os
+import logging
+import argparse
 import numpy as np
+
+from tqdm import tqdm
+from einops import rearrange
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from tqdm import tqdm
-from einops import rearrange
 from torch.utils.data import DataLoader
 
 from the_well.data import WellDataset
 
-import logging
-import argparse
-
-from .model import CNextUNetbaseline
-from .physics import PhysicsLoss
+from model import CNextUNetbaseline
+from physics import PhysicsLoss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,22 +29,39 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+torch.backends.cudnn.benchmark = True
+
 class ModelTrainer:
-    def __init__(self, path, model, device, n_workers, mu=None, sigma=None):
+    def __init__(self, path, model, device: str = 'cuda', n_workers: int = None, mu=None, sigma=None):
         self.path = path
         self.model = model
 
         if isinstance(device, str):
-            self.device = torch.device('cuda' if (device == 'cuda' and torch.cuda.is_available()) else 'cpu')
+            if device == 'cuda' and torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            else:
+                self.device = torch.device('cpu')
+
         elif isinstance(device, torch.device):
             self.device = device
         else:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-        self.n_workers = int(n_workers) if n_workers is not None else 0
+        if n_workers is None:
+            try:
+                cpu_count = os.cpu_count() or 4
+            except Exception:
+                cpu_count = 4
+            self.n_workers = max(1, min(15, cpu_count - 1))
+
+        else:
+            self.n_workers = int(n_workers)
+
         self.F = 11
+
         self.mu = mu
         self.sigma = sigma
+
         self.model_instance = None
 
     def _loader(self, split, n_steps_input, n_steps_output):
@@ -63,16 +79,23 @@ class ModelTrainer:
     def _setup(self, train_dataset, n_input, n_output):
         logging.info('Setting up model and normalisation')
 
-        if self.mu == None and self.sigma == None:
+        if self.mu is None or self.sigma == None:
             max_samples = min(30, len(train_dataset))
             sample_idx  = np.linspace(0, len(train_dataset) - 1, num=max_samples).astype(int)
 
-            mu_sum = torch.zeros(self.F)
-            sigma_sum = torch.zeros(self.F)
+            mu_sum = torch.zeros(self.F, dtype=torch.float32)
+            sigma_sum = torch.zeros(self.F, dtype=torch.float32)
             count = 0
 
             for idx in sample_idx:
-                x = train_dataset[idx]['input_fields']
+                item = train_dataset[idx]
+                x = item['input_fields']
+
+                if isinstance(x, np.ndarray):
+                    x = torch.from_numpy(x).float()
+                else:
+                    x = x.float()
+
                 x = x.reshape(-1, self.F)
 
                 mu_sum += x.mean(dim=0)
@@ -81,11 +104,20 @@ class ModelTrainer:
 
             self.mu = (mu_sum / count).to(self.device)
             self.sigma = (sigma_sum / count).to(self.device)
-            self.sigma[self.sigma == 0] = 1.0
+            self.sigma[self.sigma == 0.0] = 1.0
 
-            logging.info('Normalisation stats calculated!')
+            logging.info('Normalisation stats calculated on device %s', str(self.device))
 
         else:
+
+            if isinstance(self.mu, np.ndarray):
+                self.mu = torch.from_numpy(self.mu).float().to(self.device)
+            else:
+                self.mu = self.mu.to(self.device)
+            if isinstance(self.sigma, np.ndarray):
+                self.sigma = torch.from_numpy(self.sigma).float().to(self.device)
+            else:
+                self.sigma = self.sigma.to(self.device)
 
             logging.info('Using provided mu, sigma')
 
@@ -104,46 +136,67 @@ class ModelTrainer:
             ).to(self.device)
     
     def _preprocess(self, x):
-        if self.mu is None:
+        if self.mu is None or self.sigma is None:
             raise RuntimeError('Call _setup first!')
         
         if isinstance(x, np.ndarray):
             x = torch.from_numpy(x)
-        x = x.to(self.device)
+        else:
+            x = x.float()
+
+        x = x.to(self.device, non_blocking=(self.device.type == 'cuda'))
         return (x - self.mu) / self.sigma
     
     def _postprocess(self, y):
-        if self.mu is None:
+        if self.mu is None or self.sigma is None:
             raise RuntimeError('Call _setup first')
         
         n_channels = y.shape[1]
-        if n_channels == self.F:        
+        if n_channels == self.F:
             mu_b = self.mu.view(1, self.F, 1, 1)
             sigma_b = self.sigma.view(1, self.F, 1, 1)
         else:
-            mu_b = self.mu.repeat(n_channels // self.F).view(1, n_channels, 1, 1)
-            sigma_b = self.sigma.repeat(n_channels // self.F).view(1, n_channels, 1, 1)
+            repeat = n_channels // self.F
+            mu_b = self.mu.repeat(repeat).view(1, n_channels, 1, 1)
+            sigma_b = self.sigma.repeat(repeat).view(1, n_channels, 1, 1)
+
+        mu_b = mu_b.to(y.device, dtype=y.dtype)
+        sigma_b = sigma_b.to(y.device, dtype=y.dtype)
 
         return (y * sigma_b) + mu_b
     
-    def save_stats(self, save_dir):
+    def save_stats(self, save_dir): 
         stats_path = os.path.join(save_dir, 'stats.pt')
         torch.save({
-            'mu': self.mu,
-            'sigma': self.sigma
+            'mu': self.mu.detach().cpu(),
+            'sigma': self.sigma.detach().cpu()
         }, stats_path)
         logging.info(f'Normalisation stats saved to {stats_path}')
     
     def train_benchmark(self, batch, epochs, lr, patience, n_input, n_output):
-        self._setup(n_input, n_output)
-        optimizer = torch.optim.Adam(self.model_instance.parameters(), lr=lr)
 
         train_dataset = self._loader('train', n_input, n_output)
         valid_dataset  = self._loader('valid', n_input, n_output)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch, shuffle=True, num_workers=self.n_workers)
-        val_loader = DataLoader(valid_dataset, batch_size=batch, shuffle=False, num_workers=self.n_workers)
+        self._setup(train_dataset, n_input, n_output)
+        optimizer = torch.optim.Adam(self.model_instance.parameters(), lr=lr)
 
+        train_loader = DataLoader(train_dataset,
+                                  batch_size=batch,
+                                  shuffle=True,
+                                  num_workers=self.n_workers,
+                                  pin_memory=(self.device.type == 'cuda'),
+                                  persistent_workers=(self.n_workers > 0),
+                                  prefetch_factor=2)
+        
+        val_loader = DataLoader(valid_dataset,
+                                  batch_size=batch,
+                                  shuffle=True,
+                                  num_workers=self.n_workers,
+                                  pin_memory=(self.device.type == 'cuda'),
+                                  persistent_workers=(self.n_workers > 0),
+                                  prefetch_factor=2)
+        
         criterion = nn.MSELoss()
 
         train_losses = []
@@ -153,29 +206,35 @@ class ModelTrainer:
 
         for epoch in range(epochs):
 
-            train_loss = 0.0
             self.model_instance.train()
-            print(f'EPOCH {epoch + 1} / {epochs}')
+
+            train_loss = 0.0
+
+            logging.info(f'Starting epoch {epoch+1}/{epochs} (benchmark)')
 
             for batch in (bar := tqdm(train_loader)):
-                x = batch['input_fields']
-                xnorm = self._preprocess(x)
+
+                x_raw = batch['input_fields']
+                y_raw = batch['output_fields']
+
+                xnorm = self._preprocess(x_raw)
                 xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
 
-                y = batch['output_fields']
-                ynorm = self._preprocess(y)
+                ynorm = self._preprocess(y_raw)
                 ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
 
                 fx = self.model_instance(xnorm)
 
                 loss = criterion(fx, ynorm)
                 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
                 optimizer.step()
 
                 bar.set_postfix(loss=loss.item())
-                train_loss += loss.item()
+
+                train_loss += float(loss.detach().cpu().item())
 
             train_loss /= max(1, len(train_loader))
             train_losses.append(train_loss)
@@ -184,19 +243,20 @@ class ModelTrainer:
             val_loss = 0.0
             with torch.no_grad():
                 for batch in (bar := tqdm(val_loader)):
-                    x = batch['input_fields']
-                    x = self._preprocess(x)
-                    x = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
-                    
-                    y = batch['output_fields']
-                    y = self._preprocess(y)
-                    y = rearrange(y, "B To Lx Ly F -> B (To F) Lx Ly")
-                    
-                    fx = self.model_instance(x)
+                    x_raw = batch['input_fields']
+                    y_raw = batch['output_fields']
 
-                    loss = criterion(fx, y)
+                    xnorm = self._preprocess(x_raw)
+                    xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+
+                    ynorm = self._preprocess(y_raw)
+                    ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
+                    
+                    fx = self.model_instance(xnorm)
+
+                    loss = criterion(fx, ynorm)
                     bar.set_postfix(loss=loss.item())
-                    val_loss += loss.item()
+                    val_loss += loss.detach().cpu().item()
 
             val_loss /= max(1, len(val_loader))
             val_losses.append(val_loss)
@@ -210,7 +270,7 @@ class ModelTrainer:
                 save_dir = './outputs/baseline'
                 os.makedirs(save_dir, exist_ok=True)
 
-                torch.save(self.model_instance.state_dict(), os.path.join(save_dir, 'best_model.pth'))
+                torch.save(self.model_instance.state_dict(), os.path.join(save_dir, 'best_baseline.pth'))
                 self.save_stats(save_dir)
 
                 logging.info(f"Saved best model to {save_dir + 'best_baseline.pth'}")
@@ -223,7 +283,7 @@ class ModelTrainer:
 
         return train_losses, val_losses
     
-    def train(self, batch, epochs, warmup_epochs, lr, patience, n_input, n_output):
+    def train(self, batch, epochs, warmup_epochs, lr, patience, n_input, n_output, use_amp=True, channels_last=False, compile_model=False):
 
         train_dataset = self._loader('train', n_input, n_output)
         valid_dataset  = self._loader('valid', n_input, n_output)
@@ -236,11 +296,45 @@ class ModelTrainer:
             dt=0.5
         ).to(self.device)
 
-        params = list(self.model_instance.parameters()) + list(criterion_physics.parameters())
-        optimizer = torch.optim.Adam(params, lr=lr)
+        self.model_instance.to(self.device)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch, shuffle=True, num_workers=self.n_workers)
-        val_loader = DataLoader(valid_dataset, batch_size=batch, shuffle=False, num_workers=self.n_workers)
+        if channels_last:
+            self.model_instance.to(memory_format=torch.channels_last)
+
+        if compile_model:
+            try:
+                self.model_instance = torch.compile(self.model_instance)
+                logging.info('Model compiles with torch.compile')
+            
+            except Exception as e:
+                logging.warning(f'torch.compile failed: {e}')
+
+        model_params = list(self.model_instance.parameters())
+        physics_params = list(criterion_physics.parameters())
+
+        optimizer = torch.optim.Adam([{'params': model_params, 'lr': lr}], lr=lr)
+
+        def opt_physics(optimizer, physics_params, physics_lr=None):
+            pg = {'params': physics_params, 'lr': physics_lr if physics_lr is not None else lr, 'weight_decay': 0.0}
+            optimizer.add_param_group(pg)
+
+        train_loader = DataLoader(train_dataset,
+                                  batch_size=batch, 
+                                  shuffle=True,
+                                  num_workers=self.n_workers,
+                                  pin_memory=(self.device.type == 'cuda'),
+                                  persistent_workers=(self.n_workers > 0),
+                                  prefetch_factor=2)
+        
+        val_loader = DataLoader(valid_dataset,
+                                  batch_size=batch, 
+                                  shuffle=False,
+                                  num_workers=self.n_workers,
+                                  pin_memory=(self.device.type == 'cuda'),
+                                  persistent_workers=(self.n_workers > 0),
+                                  prefetch_factor=2)
+        
+        scaler = torch.amp.GradScaler(enabled=use_amp and (self.device.type == 'cuda'))
 
         train_losses = []
         val_losses = []
@@ -251,101 +345,148 @@ class ModelTrainer:
 
             is_warmup = epoch < warmup_epochs
 
-            if epoch % 5 == 0:
-                with torch.no_grad():
+            if epoch == warmup_epochs:
+                opt_physics(optimizer, physics_params, physics_lr=lr * 0.1)
+                logging.info("Physics parameters added to optimiser")
+
+            
+            with torch.no_grad():
+                try:
                     ws = torch.exp(-criterion_physics.log_vars)
-                    print(f"Epoch {epoch} Weights [MSE, Cont, Div, Sym, KE]:\n{ws.cpu().numpy()}")
+                    logging.info("Epoch %d physics weights: %s", epoch + 1, np.array2string(ws.detach().cpu().numpy(), precision=4))
+                except Exception:
+                    pass
+
+            self.model_instance.train()
+            train_loss = 0.0
 
             for batch in (bar := tqdm(train_loader)):
-                x = batch['input_fields']
+                
+                x_raw = batch['input_fields']
+                y_raw = batch['output_fields']
 
-                xprev = x[:, -1, ...].to(self.device)
+                if isinstance(x_raw, np.ndarray):
+                    xprev = torch.from_numpy(x_raw[:, -1, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
+                else:
+                    xprev = x_raw[:, -1, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
+
                 xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
 
-                x = self._preprocess(x)
-                xnorm = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+                if isinstance(y_raw, np.ndarray):
+                    yphys = torch.from_numpy(y_raw[:, 0, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
+                else:
+                    yphys = y_raw[:, 0, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
 
-                y = batch['output_fields']
-                
-                yphys = y[:, 0, ...].to(self.device)
                 yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
 
-                ynorm = self._preprocess(y)
+                xnorm = self._preprocess(x_raw)      # already moved to device
+                xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+                ynorm = self._preprocess(y_raw)
                 ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
 
-                fx = self.model_instance(xnorm)
+                if channels_last:
+                    xnorm = xnorm.contiguous(memory_format=torch.channels_last)
+                    ynorm = ynorm.contiguous(memory_format=torch.channels_last)
 
-                if is_warmup:
-                    loss = F.mse_loss(fx, ynorm)
-                else:
-                    loss_mse = F.mse_loss(fx, ynorm)
+                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                    
+                    fx = self.model_instance(xnorm)
+                    
+                    if is_warmup:
+                        loss = F.mse_loss(fx, ynorm)
+                    else:
+                        loss_mse = F.mse_loss(fx, ynorm)
+                        
+                        fx_phys = self._postprocess(fx)
 
-                    fx_phys = self._postprocess(fx)
+                        loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
 
-                    loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
-
-                    loss = loss_mse + loss_physics
+                        loss = loss_mse + loss_physics
                 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
-                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
+                    optimizer.step()
 
                 bar.set_postfix(loss=loss.item(), phase="Warmup" if is_warmup else "Hybrid")
-                train_loss += loss.item()
+                
+                train_loss += float(loss.detach().cpu().item())
 
             train_loss /= max(1, len(train_loader))
             train_losses.append(train_loss)
+            logging.info(f"Epoch {epoch+1} train loss: {train_loss:.6f}")
 
             self.model_instance.eval()
             val_loss = 0.0
             with torch.no_grad():
                 for batch in (bar := tqdm(val_loader)):
-                    x = batch['input_fields']
+                    x_raw = batch['input_fields']
+                    y_raw = batch['output_fields']
 
-                    xprev = x[:, -1, ...].to(self.device)
+                    if isinstance(x_raw, np.ndarray):
+                        xprev = torch.from_numpy(x_raw[:, -1, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
+                    else:
+                        xprev = x_raw[:, -1, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
+
                     xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
 
-                    x = self._preprocess(x)
-                    xnorm = rearrange(x, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+                    if isinstance(y_raw, np.ndarray):
+                        yphys = torch.from_numpy(y_raw[:, 0, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
+                    else:
+                        yphys = y_raw[:, 0, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
 
-                    y = batch['output_fields']
-                
-                    yphys = y[:, 0, ...].to(self.device)
                     yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
 
-                    ynorm = self._preprocess(y)
+                    xnorm = self._preprocess(x_raw)      # already moved to device
+                    xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+                    ynorm = self._preprocess(y_raw)
                     ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
 
-                    fx = self.model_instance(xnorm)
-
+                    if channels_last:
+                        xnorm = xnorm.contiguous(memory_format=torch.channels_last)
+                        ynorm = ynorm.contiguous(memory_format=torch.channels_last)
+                        
                     if is_warmup:
-                        loss = F.mse_loss(fx, ynorm)
+                        loss = F.mse_loss(self.model_instance(xnorm), ynorm)
                     else:
-                        loss_mse = F.mse_loss(fx, ynorm)
-
+                        fx = self.model_instance(xnorm)
+                        
+                        loss_mse = F.mse_loss(fx, ynorm)    
                         fx_phys = self._postprocess(fx)
                         loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
 
                         loss = loss_mse + loss_physics
 
                     bar.set_postfix(loss=loss.item())
-                    val_loss += loss.item()
+                    val_loss += float(loss.detach().cpu().item())
 
             val_loss /= max(1, len(val_loader))
             val_losses.append(val_loss)
+            logging.info(f"Epoch {epoch+1} val loss: {val_loss:.6f}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_count = 0
-
                 save_dir = './outputs/'
                 os.makedirs(save_dir, exist_ok=True)
-
-                torch.save(self.model_instance.state_dict(), save_dir + 'best_model.pth')
+                ckpt_path = os.path.join(save_dir, f'best_model_epoch{epoch+1}.pth')
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state': self.model_instance.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'mu': self.mu.detach().cpu(),
+                    'sigma': self.sigma.detach().cpu()
+                }, ckpt_path)
                 self.save_stats(save_dir)
-
-                logging.info(f"Saved best model to {save_dir + 'best_model.pth'}")
+                logging.info(f"Saved best model to {ckpt_path}")
             else:
                 patience_count += 1
 
@@ -353,14 +494,14 @@ class ModelTrainer:
                 print('Early stop triggered')
                 break
 
-        print(f'mu: {self.mu}')
-        print(f'sigma: {self.sigma}')
+        logging.info(f'Final mu: {self.mu}')
+        logging.info(f'Final sigma: {self.sigma}')
 
         return train_losses, val_losses
 
 def main():
     parser = argparse.ArgumentParser(
-        prog = 'UNetConvNext baseline model trainer',
+        prog = 'Project03 Model Trainer (benchmark + hybrid)',
         description = 'Model trainer for the active_matter dataset of The Well'
     )
 
@@ -387,20 +528,21 @@ def main():
     if mode == 1:
         train, valid = trainer.train_benchmark(batch=4, epochs=156, lr=5e-3, patience=5, n_input=4, n_output=1)
     elif mode == 2:
-        train, valid = trainer.train(batch=4, epochs=156, warmup_epochs=5, lr=5e-3, patience=5, n_input=4, n_output=1)
+        train, valid = trainer.train(batch=4, epochs=156, warmup_epochs=15, lr=1.5e-4, patience=5, n_input=4, n_output=1)
 
     print('TRAINING successful')
 
-    outfile = 'losses.dat'
+    os.makedirs('./outputs', exist_ok=True)
+    outfile = './outputs/losses.dat'
     with open(outfile, 'w') as f:
         f.write('epoch train_loss valid_loss\n')
         maxlen = max(len(train), len(valid))
         for i in range(maxlen):
-            t = train[i] if i < len(train) else 0
-            v = valid[i] if i < len(valid) else 0
+            t = train[i] if i < len(train) else 0.0
+            v = valid[i] if i < len(valid) else 0.0
             f.write(f'{i+1} {t} {v}\n')
 
-    print('losses.dat file located in ./outputs')
+    logging.info('Training finished. Losses written to %s', outfile)
 
 if __name__ == '__main__':
     main()
