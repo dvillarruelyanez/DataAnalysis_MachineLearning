@@ -3,7 +3,9 @@
 This directory contains visual comparisons between the Ground Truth (real microscopy data) and the Model Predictions.
 
 ## Video Categories
-
+### Data Processing Pipeline Validation
+* **File:** `Inspection_Key_Bmp_tes_E0007.mp4`
+* **Observation:** A side-by-side comparison between the raw microscopy feed and the final preprocessed input. This visualizes the efficacy of the data pipeline.
 ### One-Step Forecasting (Short-Term)
 * **Files:** `video_2_WT_onestep.mp4`, `video_3_BMP_onestep.mp4`, `video_4_Nodal_onestep.mp4`
 * **Observation:** These videos demonstrate the model's high fidelity in capturing immediate cellular rearrangements and tissue boundaries.
