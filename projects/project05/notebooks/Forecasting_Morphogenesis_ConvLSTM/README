@@ -1,0 +1,29 @@
+# Deep Learning for Spatiotemporal Forecasting of Embryonic Development
+
+Predicting morphological dynamics of Zebrafish embryos using Stacked ConvLSTMs and computer vision pipelines.
+
+Project Overview
+
+This project implements a spatiotemporal deep learning framework to forecast the development of Zebrafish embryos from 2 to 16 hours post-fertilization (hpf). The model is designed to handle high-resolution brightfield microscopy data across three distinct genetic phenotypes:
+* Wild Type (WT).
+* BMP Mutants.
+* Nodal Mutants.
+
+The core architecture uses Stacked ConvLSTMs to learn cellular dynamics, enabling both one-step-ahead forecasting and autoregressive trajectory generation.
+
+## Key Features
+
+* Custom Data Pipeline: End-to-end processing including phase-correlation drift correction, adaptive masking, and tensor normalization.
+* Loss Function: A composite loss designed to optimize structural fidelity:
+  $$L_{total} = 0.6 \cdot MSE + 0.2 \cdot Gradient + 0.2 \cdot SSIM$$
+* Robust Architecture: 3-layer ConvLSTM (32, 32, 64 filters) preserving spatial resolution (128x128).
+* Evaluation Protocols: Rigorous testing under both One-Step (short-term) and Autoregressive (long-term) inference regimes.
+
+## Repository Structure
+ main.ipynb # Demonstration notebook (Training & Visualization) 
+ src/ 
+ dataset.py # Custom Dataset class, DataLoaders, and Augmentations 
+ models.py # ConvLSTM architecture definition 
+ losses.py # Composite Loss implementation (SSIM + Grad + MSE) 
+ trainer.py # Training loop, validation, and checkpointing 
+ utils.py # Plotting functions and helper tools 
