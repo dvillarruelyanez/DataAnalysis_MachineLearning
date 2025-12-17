@@ -7,12 +7,20 @@ Daniel Villarruel-Yanez (2025.11.25)
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict
 import torch.nn.functional as F
+
+from typing import Tuple, Dict
 
 class PhysicsLoss(nn.Module):
     
-    def __init__(self, spatial_dims: Tuple[int, int], dx: float, dt: float, derivative_scheme: str ='central_diff'):
+    def __init__(self,
+                 spatial_dims: Tuple[int, int],
+                 dx: float,
+                 dt: float, 
+                 derivative_scheme: str ='sobel',
+                 smooth_before: bool = True,
+                 logvar_clamp: Tuple[float, float] = (-10., 10.)):
+        
         super().__init__()
         self.h, self.w = spatial_dims
         self.dx = float(dx)
@@ -20,53 +28,62 @@ class PhysicsLoss(nn.Module):
 
         self.loss_keys = ['continuity', 'divergence', 'strain_consistency', 'symmetry', 'KE']
 
-        init_val = 1.0
+        init_val = 5.0
         self.log_vars = nn.Parameter(torch.full((len(self.loss_keys),), init_val, dtype=torch.float32))
 
         if derivative_scheme not in ['central_diff', 'sobel']:
             raise ValueError('Incorrect derivative scheme. Use "central_diff" or "sobel"')
         
         if derivative_scheme == 'central_diff':
-            self.register_buffer('kernel_x', torch.tensor([[[[0, 0, 0],
-                                                             [-0.5, 0, 0.5],
-                                                             [0, 0, 0]]]], dtype=torch.float32) / self.dx)
-        
-            self.register_buffer('kernel_y', torch.tensor([[[[0, -0.5, 0],
-                                                             [0, 0, 0],
-                                                             [0, 0.5, 0]]]], dtype=torch.float32) / self.dx)
+            kx = torch.tensor([[[[0, 0, 0], [-0.5, 0, 0.5], [0, 0, 0]]]], dtype=torch.float32) / (2.0 * self.dx)
+            ky = torch.tensor([[[[0, -0.5, 0], [0, 0, 0], [0, 0.5, 0]]]], dtype=torch.float32) / (2.0 * self.dx)
             
         else:
-            self.register_buffer('kernel_x', torch.tensor([[[[-1, 0, 1],
-                                                             [-2, 0, 2],
-                                                             [-1, 0, 1]]]], dtype=torch.float32) / 8.0)
+            kx = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32) / (8.0 * self.dx)
+            ky = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32) / (8.0 * self.dx)
             
-            self.register_buffer('kernel_y', torch.tensor([[[[-1, -2, -1],
-                                                             [0, 0, 0],
-                                                             [1, 2, 1]]]], dtype=torch.float32) / 8.0)
+        self.register_buffer('kernel_x', kx)
+        self.register_buffer('kernel_y', ky)
+
+        self.smooth_before = bool(smooth_before)
+        self.logvar_clamp_min = float(logvar_clamp[0])
+        self.logvar_clamp_max = float(logvar_clamp[1])
 
     def spatial_gradient(self, field):
         """
         """
+
         if field.dim() == 3:
             field = field.unsqueeze(1)
-        elif field.dim() == 4 and field.size(1) != 1:
-            b, c, h, w = field.shape
-            field = field.view(b*c, 1, h, w)
+
+        if self.smooth_before:
+            field = F.avg_pool2d(field, kernel_size=3, stride=1, padding=1)
 
         field_pad = F.pad(field, (1, 1, 1, 1), mode='circular')
 
-        d_dx = F.conv2d(field_pad, self.kernel_x) / self.dx
-        d_dy = F.conv2d(field_pad, self.kernel_y) / self.dx
+        kx = self.kernel_x.to(field.dtype).to(field.device)
+        ky = self.kernel_y.to(field.dtype).to(field.device)
+
+        channels = field.shape[1]
+        kx_rep = kx.repeat(channels, 1, 1, 1)
+        ky_rep = ky.repeat(channels, 1, 1, 1)
+
+        d_dx = F.conv2d(field_pad, kx_rep, groups=channels)
+        d_dy = F.conv2d(field_pad, ky_rep, groups=channels)
 
         return d_dx.squeeze(1), d_dy.squeeze(1)
 
     def forward(self, ypred, ytrue, xprev=None):
-        
-        assert ypred.dim() == 4 and ytrue.dim() == 4, "ypred and ytrue must be (B, C, H, W)"
-        device = ypred.device()
-        dtype  = ypred.dtype
+
+        ypred = ypred.float()
+        ytrue = ytrue.float()
+        if xprev is not None:
+            xprev = xprev.float()
+
+        log_vars = torch.clamp(self.log_vars, min=self.logvar_clamp_min, max=self.logvar_clamp_max)
 
         losses: Dict[str, torch.Tensor] = {}
+        device = ypred.device
 
         rho = ypred[:, 0]
         vx  = ypred[:, 1]
@@ -129,18 +146,23 @@ class PhysicsLoss(nn.Module):
         vpred = vx**2 + vy**2
         vtrue = vx_true**2 + vy_true**2
 
-        kpred = 0.5 * torch.sum(rho * vpred, dim=(1, 2))
-        ktrue = 0.5 * torch.sum(rho_true * vtrue, dim=(1, 2))
+        kpred = 0.5 * torch.mean(rho * vpred, dim=(1, 2))
+        ktrue = 0.5 * torch.mean(rho_true * vtrue, dim=(1, 2))
 
         losses['KE'] = F.mse_loss(kpred, ktrue)
 
-        final_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        assert len(self.log_vars) == len(self.loss_keys), "log_vars must match loss_keys length"
+        final_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        pure_weighted_error = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for i, key in enumerate(self.loss_keys):
             log_var = self.log_vars[i]
             precision = torch.exp(-log_var)
             comp = losses[key]
-            final_loss += 0.5 * precision * comp + 0.5 * log_var
 
-        return final_loss, losses
+            term_error = 0.5 * precision * comp
+            term_reg   = 0.5 * log_var
+
+            final_loss += (term_error + term_reg)
+            pure_weighted_error += term_error
+
+        return final_loss, losses, pure_weighted_error

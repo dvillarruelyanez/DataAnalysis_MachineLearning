@@ -29,6 +29,8 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 class ModelTrainer:
@@ -52,7 +54,8 @@ class ModelTrainer:
                 cpu_count = os.cpu_count() or 4
             except Exception:
                 cpu_count = 4
-            self.n_workers = max(1, min(15, cpu_count - 1))
+
+            self.n_workers = min(4, cpu_count)
 
         else:
             self.n_workers = int(n_workers)
@@ -134,6 +137,8 @@ class ModelTrainer:
             blocks_per_stage=2,
             bottleneck_blocks=1
             ).to(self.device)
+        
+        self.model_instance.to(memory_format=torch.channels_last)
     
     def _preprocess(self, x):
         if self.mu is None or self.sigma is None:
@@ -283,7 +288,7 @@ class ModelTrainer:
 
         return train_losses, val_losses
     
-    def train(self, batch, epochs, warmup_epochs, lr, patience, n_input, n_output, use_amp=True, channels_last=False, compile_model=False):
+    def train(self, batch, epochs, warmup_epochs, lr, patience, n_input, n_output, use_amp=True, channels_last=True, compile_model=False):
 
         train_dataset = self._loader('train', n_input, n_output)
         valid_dataset  = self._loader('valid', n_input, n_output)
@@ -292,9 +297,11 @@ class ModelTrainer:
 
         criterion_physics = PhysicsLoss(
             spatial_dims=(256, 256),
-            dx=1.0,
-            dt=0.5
+            dx=0.0390625,
+            dt=0.25
         ).to(self.device)
+
+        criterion_physics.log_vars.requires_grad_(False)
 
         self.model_instance.to(self.device)
 
@@ -312,75 +319,82 @@ class ModelTrainer:
         model_params = list(self.model_instance.parameters())
         physics_params = list(criterion_physics.parameters())
 
-        optimizer = torch.optim.Adam([{'params': model_params, 'lr': lr}], lr=lr)
+        # optimizer = torch.optim.Adam([{'params': model_params, 'lr': lr}], lr=lr)
 
-        def opt_physics(optimizer, physics_params, physics_lr=None):
-            pg = {'params': physics_params, 'lr': physics_lr if physics_lr is not None else lr, 'weight_decay': 0.0}
-            optimizer.add_param_group(pg)
+        # def opt_physics(optimizer, physics_params, physics_lr=None):
+        #     pg = {'params': physics_params, 'lr': physics_lr if physics_lr is not None else lr, 'weight_decay': 0.0}
+        #     optimizer.add_param_group(pg)
+
+        optimizer = torch.optim.Adam([
+            {'params': model_params, 'lr': lr},
+            {'params': physics_params, 'lr': lr * 0.1}
+        ], lr=lr)
 
         train_loader = DataLoader(train_dataset,
                                   batch_size=batch, 
                                   shuffle=True,
-                                  num_workers=self.n_workers,
-                                  pin_memory=(self.device.type == 'cuda'),
+                                  num_workers=max(0, min(self.n_workers, 4)),
+                                  pin_memory=False,
                                   persistent_workers=(self.n_workers > 0),
-                                  prefetch_factor=2)
+                                  prefetch_factor=1)
         
         val_loader = DataLoader(valid_dataset,
                                   batch_size=batch, 
                                   shuffle=False,
-                                  num_workers=self.n_workers,
-                                  pin_memory=(self.device.type == 'cuda'),
+                                  num_workers=max(0, min(self.n_workers, 4)),
+                                  pin_memory=False,
                                   persistent_workers=(self.n_workers > 0),
-                                  prefetch_factor=2)
+                                  prefetch_factor=1)
         
-        scaler = torch.amp.GradScaler(enabled=use_amp and (self.device.type == 'cuda'))
+        scaler = torch.amp.GradScaler(enabled=use_amp)
 
-        train_losses = []
-        val_losses = []
+        train_history = {'mse': [], 'phys': [], 'total': []}
+        val_history   = {'mse': [], 'phys': [], 'total': []}
+
         best_val_loss = float('inf')
         patience_count = 0
+        ramp_up_epochs = 10
 
         for epoch in range(epochs):
 
             is_warmup = epoch < warmup_epochs
 
+            if is_warmup:
+                alpha = 0.0
+            else:
+                progress = (epoch - warmup_epochs) / max(1, ramp_up_epochs)
+                alpha = min(1.0, progress)
+
             if epoch == warmup_epochs:
-                opt_physics(optimizer, physics_params, physics_lr=lr * 0.1)
-                logging.info("Physics parameters added to optimiser")
+                logging.info("Warmup finished. Unfreezing physics parameters and resetting early stopping baseline.")
+                criterion_physics.log_vars.requires_grad_(True)
+                best_val_loss = float('inf')
+                patience_count = 0
+                # opt_physics(optimizer, physics_params, physics_lr=lr * 0.1)
+                # logging.info("Physics parameters added to optimiser")
 
             
             with torch.no_grad():
                 try:
-                    ws = torch.exp(-criterion_physics.log_vars)
+                    ws = torch.exp(-torch.clamp(criterion_physics.log_vars, min=-10.0, max=10.0))
                     logging.info("Epoch %d physics weights: %s", epoch + 1, np.array2string(ws.detach().cpu().numpy(), precision=4))
                 except Exception:
                     pass
 
             self.model_instance.train()
-            train_loss = 0.0
+            epoch_mse   = 0.0
+            epoch_phys  = 0.0
+            epoch_total = 0.0
+            n_batches_done = 0
 
             for batch in (bar := tqdm(train_loader)):
                 
-                x_raw = batch['input_fields']
-                y_raw = batch['output_fields']
+                x_raw = batch['input_fields'].to(self.device, non_blocking=(self.device.type=='cuda'))
+                y_raw = batch['output_fields'].to(self.device, non_blocking=(self.device.type=='cuda'))
 
-                if isinstance(x_raw, np.ndarray):
-                    xprev = torch.from_numpy(x_raw[:, -1, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-                else:
-                    xprev = x_raw[:, -1, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-
-                xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
-
-                if isinstance(y_raw, np.ndarray):
-                    yphys = torch.from_numpy(y_raw[:, 0, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-                else:
-                    yphys = y_raw[:, 0, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-
-                yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
-
-                xnorm = self._preprocess(x_raw)      # already moved to device
+                xnorm = self._preprocess(x_raw)
                 xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
+
                 ynorm = self._preprocess(y_raw)
                 ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
 
@@ -388,64 +402,136 @@ class ModelTrainer:
                     xnorm = xnorm.contiguous(memory_format=torch.channels_last)
                     ynorm = ynorm.contiguous(memory_format=torch.channels_last)
 
-                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                    
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     fx = self.model_instance(xnorm)
+                
+                loss_mse = F.mse_loss(fx, ynorm)
                     
-                    if is_warmup:
-                        loss = F.mse_loss(fx, ynorm)
-                    else:
-                        loss_mse = F.mse_loss(fx, ynorm)
-                        
-                        fx_phys = self._postprocess(fx)
+                if is_warmup:
+                    loss = loss_mse
+                    phys_error_display = 0.0
 
-                        loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
+                else:
+                    with torch.amp.autocast(enabled=False):
+                        fx32 = fx.float()
+                        fx_phys = self._postprocess(fx32)
 
-                        loss = loss_mse + loss_physics
+                        xprev = x_raw[:, -1, ...].float().to(self.device) 
+                        xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
+
+                        yphys = y_raw[:, 0, ...].float()
+                        yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
+
+                        loss_physics_total, _, loss_physics_error_only = criterion_physics(fx_phys, yphys, xprev)
+
+                        loss = loss_mse + (alpha * loss_physics_total)
+
+                        phys_error_display = loss_physics_error_only.item()
+
+                if not torch.isfinite(loss) or torch.isnan(loss) or not torch.isfinite(loss_mse):
+                    logging.warning("Non-finite loss detected (train) - skipping batch")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue                
                 
                 optimizer.zero_grad(set_to_none=True)
 
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
+                backward_succeeded = False
+                if use_amp:
+                    try:
+                        scaler.scale(loss).backward()
+                        backward_succeeded = True
+                    except RuntimeError as e:
+                        logging.warning("GradScaler backward failed with RuntimeError: %s. Falling back to fp32 backward for this batch.", e)
+                        torch.cuda.empty_cache()
+                        backward_succeeded = False
+
+                if not use_amp or not backward_succeeded:
+                    with torch.amp.autocast(enabled=False):
+                        fx = self.model_instance(xnorm)
+                        loss_mse = F.mse_loss(fx, ynorm)
+
+                        if is_warmup:
+                            loss = loss_mse
+                            phys_error_display = 0.0
+                        else:
+                            fx32 = fx.float()
+                            fx_phys = self._postprocess(fx32)
+                            xprev = x_raw[:, -1, ...].float().to(self.device)
+                            xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
+                            yphys = y_raw[:, 0, ...].float().to(self.device)
+                            yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
+                            loss_physics_total, _, loss_physics_error = criterion_physics(fx, yphys, xprev)
+                            loss2 = loss_mse + (alpha * loss_physics_total)
+                            phys_error_display = float(loss_physics_error.detach().cpu().item())
+
+                    if not torch.isfinite(loss2) or not torch.isfinite(loss_mse):
+                        logging.warning("Non-finite loss detected during fp32 fallback - skipping batch")
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+
+                    loss2.backward()
                     torch.nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
                     optimizer.step()
+                    epoch_mse += float(loss_mse.detach().cpu().item())
+                    epoch_phys += phys_error_display
+                    epoch_total += float(loss2.detach().cpu().item())
+                    n_batches_done += 1
+                    bar.set_postfix(mse=f"{loss_mse.item():.6f}", phys=f"{phys_error_display:.6f}", alpha=f"{alpha:.2f}")
+                    with torch.no_grad():
+                        criterion_physics.log_vars.clamp_(-10.0, 10.0)
+                    continue
 
-                bar.set_postfix(loss=loss.item(), phase="Warmup" if is_warmup else "Hybrid")
+                #scaler.scale(loss).backward()
+
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model_instance.parameters(), 1.0)
+
+                grads_finite = True
+                for p in list(self.model_instance.parameters()) + list(criterion_physics.parameters()):
+                    if p.grad is not None:
+                        if not torch.isfinite(p.grad).all():
+                            grads_finite = False
+                            break
+
+                if not grads_finite:
+                    logging.warning("Non-finite gradients detected - skipping optimizer step")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
+
+                scaler.step(optimizer)
+                scaler.update()
+
+                with torch.no_grad():
+                    criterion_physics.log_vars.clamp_(-10.0, 10.0)
+
+                epoch_mse += float(loss_mse.detach().cpu().item())
+                epoch_phys += phys_error_display
+                epoch_total += float(loss.detach().cpu().item())
+                n_batches_done += 1
+
+                bar.set_postfix(mse=f"{loss_mse.item():.4f}", phys=f"{phys_error_display:.4f}", alpha=f"{alpha:.2f}")
+
+            if n_batches_done == 0:
+                logging.warning("All training batches skipped in epoch %d", epoch + 1)
+                n_batches_done = 1
                 
-                train_loss += float(loss.detach().cpu().item())
-
-            train_loss /= max(1, len(train_loader))
-            train_losses.append(train_loss)
-            logging.info(f"Epoch {epoch+1} train loss: {train_loss:.6f}")
+            train_history['mse'].append(epoch_mse / n_batches_done)
+            train_history['phys'].append(epoch_phys / n_batches_done)
+            train_history['total'].append(epoch_total / n_batches_done)
 
             self.model_instance.eval()
-            val_loss = 0.0
+            val_mse = 0.0
+            val_phys = 0.0
+            val_total = 0.0
+            n_val_done = 0
+
             with torch.no_grad():
                 for batch in (bar := tqdm(val_loader)):
-                    x_raw = batch['input_fields']
-                    y_raw = batch['output_fields']
+                    x_raw = batch['input_fields'].to(self.device, non_blocking=(self.device.type=='cuda'))
+                    y_raw = batch['output_fields'].to(self.device, non_blocking=(self.device.type=='cuda'))
 
-                    if isinstance(x_raw, np.ndarray):
-                        xprev = torch.from_numpy(x_raw[:, -1, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-                    else:
-                        xprev = x_raw[:, -1, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-
-                    xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
-
-                    if isinstance(y_raw, np.ndarray):
-                        yphys = torch.from_numpy(y_raw[:, 0, ...]).float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-                    else:
-                        yphys = y_raw[:, 0, ...].float().to(self.device, non_blocking=(self.device.type == 'cuda'))
-
-                    yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
-
-                    xnorm = self._preprocess(x_raw)      # already moved to device
+                    xnorm = self._preprocess(x_raw)
                     xnorm = rearrange(xnorm, "B Ti Lx Ly F -> B (Ti F) Lx Ly")
                     ynorm = self._preprocess(y_raw)
                     ynorm = rearrange(ynorm, "B To Lx Ly F -> B (To F) Lx Ly")
@@ -453,27 +539,61 @@ class ModelTrainer:
                     if channels_last:
                         xnorm = xnorm.contiguous(memory_format=torch.channels_last)
                         ynorm = ynorm.contiguous(memory_format=torch.channels_last)
-                        
-                    if is_warmup:
-                        loss = F.mse_loss(self.model_instance(xnorm), ynorm)
-                    else:
+
+                    with torch.amp.autocast('cuda', enabled=use_amp):
                         fx = self.model_instance(xnorm)
+                        loss_mse = F.mse_loss(fx, ynorm)
                         
-                        loss_mse = F.mse_loss(fx, ynorm)    
-                        fx_phys = self._postprocess(fx)
-                        loss_physics, components = criterion_physics(fx_phys, yphys, xprev)
+                        if is_warmup:
+                            loss = loss_mse
+                            phys_error_display = 0.0
 
-                        loss = loss_mse + loss_physics
+                        else:
+                            with torch.amp.autocast(enabled=False):
+                                fx32 = fx.float()
+                                fx_phys = self._postprocess(fx32)
 
-                    bar.set_postfix(loss=loss.item())
-                    val_loss += float(loss.detach().cpu().item())
+                                xprev = x_raw[:, -1, ...].float()
+                                xprev = rearrange(xprev, "B Lx Ly F -> B F Lx Ly")
 
-            val_loss /= max(1, len(val_loader))
-            val_losses.append(val_loss)
-            logging.info(f"Epoch {epoch+1} val loss: {val_loss:.6f}")
+                                yphys = y_raw[:, 0, ...].float()
+                                yphys = rearrange(yphys, "B Lx Ly F -> B F Lx Ly")
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+                                loss_physics_total, _, loss_physics_error_only = criterion_physics(fx_phys, yphys, xprev)
+
+                                loss = loss_mse + (alpha * loss_physics_total)
+
+                                phys_error_display = loss_physics_error_only.item()
+
+                    if not torch.isfinite(loss) or not torch.isfinite(loss_mse):
+                        logging.warning("Non-finite loss detected in validation - skipping batch")
+                        continue
+
+                    val_mse += float(loss_mse.detach().cpu().item())
+                    val_phys += phys_error_display
+                    val_total += float(loss.detach().cpu().item())
+                    n_val_done += 1
+
+                    bar.set_postfix(
+                    mse=f"{loss_mse.item():.4f}", 
+                    phys_err=f"{phys_error_display:.4f}",
+                    alpha=f"{alpha:.2f}"
+                    )
+
+            if n_val_done == 0:
+                logging.warning("All validation batches skipped in epoch %d", epoch + 1)
+                n_val_done = 1
+
+            avg_val_total = val_total / n_val_done
+
+            val_history['mse'].append(val_mse / n_val_done)
+            val_history['phys'].append(val_phys / n_val_done)
+            val_history['total'].append(avg_val_total)
+
+            current_metric = avg_val_total
+
+            if current_metric < best_val_loss:
+                best_val_loss = current_metric
                 patience_count = 0
                 save_dir = './outputs/'
                 os.makedirs(save_dir, exist_ok=True)
@@ -489,15 +609,14 @@ class ModelTrainer:
                 logging.info(f"Saved best model to {ckpt_path}")
             else:
                 patience_count += 1
-
-            if patience_count >= patience:
-                print('Early stop triggered')
-                break
+                if patience_count >= patience:
+                    print(f'Early stop triggered at epoch {epoch+1}')
+                    break
 
         logging.info(f'Final mu: {self.mu}')
         logging.info(f'Final sigma: {self.sigma}')
 
-        return train_losses, val_losses
+        return train_history, val_history
 
 def main():
     parser = argparse.ArgumentParser(
@@ -526,23 +645,42 @@ def main():
     trainer = ModelTrainer(path, CNextUNetbaseline, device, n_workers)
 
     if mode == 1:
-        train, valid = trainer.train_benchmark(batch=4, epochs=156, lr=5e-3, patience=5, n_input=4, n_output=1)
+        train, valid = trainer.train_benchmark(batch=6, epochs=156, lr=5e-3, patience=5, n_input=4, n_output=1)
+
+        outfile = './outputs/losses_benchmark.dat'
+        with open(outfile, 'w') as f:
+            f.write('epoch train_loss valid_loss\n')
+            maxlen = max(len(train), len(valid))
+            for i in range(maxlen):
+                t = train[i] if i < len(train) else 0.0
+                v = valid[i] if i < len(valid) else 0.0
+                f.write(f'{i+1} {t:.6f} {v:.6f}\n')
+                
+        logging.info('Benchmark training finished. Losses written to %s', outfile)
+
     elif mode == 2:
-        train, valid = trainer.train(batch=4, epochs=156, warmup_epochs=15, lr=1.5e-4, patience=5, n_input=4, n_output=1)
+        train_hist, val_hist = trainer.train(batch=6, epochs=156, warmup_epochs=15, lr=1e-4, patience=5, n_input=4, n_output=1)
+
+        os.makedirs('./outputs', exist_ok=True)
+        outfile = './outputs/losses_hybrid.dat'
+        with open(outfile, 'w') as f:
+            f.write('epoch train_mse train_phys train_total valid_mse valid_phys valid_total\n')
+        
+            maxlen = len(train_hist['total'])
+            for i in range(maxlen):
+                tm = train_hist['mse'][i]
+                tp = train_hist['phys'][i]
+                tt = train_hist['total'][i]
+                    
+                vm = val_hist['mse'][i]
+                vp = val_hist['phys'][i]
+                vt = val_hist['total'][i]
+                    
+                f.write(f'{i+1} {tm:.6f} {tp:.6f} {tt:.6f} {vm:.6f} {vp:.6f} {vt:.6f}\n')
+
+        logging.info('Training finished. Losses written to %s', outfile)
 
     print('TRAINING successful')
-
-    os.makedirs('./outputs', exist_ok=True)
-    outfile = './outputs/losses.dat'
-    with open(outfile, 'w') as f:
-        f.write('epoch train_loss valid_loss\n')
-        maxlen = max(len(train), len(valid))
-        for i in range(maxlen):
-            t = train[i] if i < len(train) else 0.0
-            v = valid[i] if i < len(valid) else 0.0
-            f.write(f'{i+1} {t} {v}\n')
-
-    logging.info('Training finished. Losses written to %s', outfile)
 
 if __name__ == '__main__':
     main()
