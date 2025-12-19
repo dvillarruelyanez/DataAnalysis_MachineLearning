@@ -1,0 +1,10 @@
+Model Architecture Diagrams
+
+This directory contains visual representations of the spatiotemporal deep learning model used in this project.
+
+Files Description
+
+* Figure1A:
+    Illustrates the **Stacked ConvLSTM** architecture, consisting of three recurrent layers that process sequences of 10 past frames to predict the subsequent developmental state ($t+1$). 
+* Figure 1B:
+    Details the internal gating mechanism (Input, Forget, and Output gates) of a single ConvLSTM cell. 

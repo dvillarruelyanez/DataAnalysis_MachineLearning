@@ -1,0 +1,12 @@
+# Quantitative Evaluation Metrics
+
+This directory contains the statistical performance analysis of the model on the unseen test set.
+
+The plots are divided into two inference regimes:
+
+### 1. Short-Term Fidelity (One-Step Prediction)
+* **Files:** `Dev_Error_MSE.svg`, `Dev_Error_SSIM.svg`, `Dev_Error_Grad.svg`
+* **Description:** Shows the immediate prediction error across the biological timeline (2h - 16hpf).
+### 2. Long-Term Stability (Autoregressive Degradation)
+* **Files:** `AR_Degradation_MSE.svg`, `AR_Degradation_SSIM.svg`, `AR_Degradation_Grad.svg`
+* **Description:** Tracks the accumulation of error over extended forecast horizons when the model feeds its own predictions back into the input (closed-loop).
